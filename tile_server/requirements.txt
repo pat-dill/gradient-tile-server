@@ -1,0 +1,10 @@
+fastapi
+httpx
+pillow
+geopy
+shapely
+mercantile
+mapbox_vector_tile
+pyproj
+diskcache
+pydantic
