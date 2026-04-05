@@ -15,20 +15,30 @@ const SLOPE_LAYER = "slope-fill";
 
 /** Below this zoom, slope cells are not computed and the overlay is cleared (the map can still zoom out). */
 const MIN_RENDER_ZOOM = 9;
-const MIN_SCALE = 12;
-const MAX_SCALE = 50;
-const PERCENTILE = 0.985;
+const MAX_SCALE = 100;
+/** Top of the scale uses this percentile of visible slopes (not 100%). */
+const HIGH_PERCENTILE = 0.985;
+/** One stop per color: P0, P20, P40, P60, P98.5 — scale position matches percentile except the cap above. */
+const STOP_PERCENTILES = [0, 0.25, 0.5, 0.75, HIGH_PERCENTILE] as const;
 const ZOOM_SETTLE_MS = 400;
 const COLORS = ["#00ff00", "#ffff00", "#ff0000", "#ff00ff", "#ffffff"];
 
-function buildFillColor(maxSlope: number) {
-  const step = maxSlope / (COLORS.length - 1);
-  return [
-    "interpolate",
-    ["linear"],
-    ["get", "slope"],
-    ...COLORS.flatMap((color, i) => [step * i, color]),
-  ];
+function percentileOfSorted(sorted: number[], p: number): number {
+  const n = sorted.length;
+  if (n === 0) return 0;
+  if (n === 1) return sorted[0]!;
+  const x = p * (n - 1);
+  const lo = Math.floor(x);
+  const hi = Math.ceil(x);
+  const a = sorted[lo]!;
+  if (lo === hi) return a;
+  const b = sorted[hi]!;
+  return a + (b - a) * (x - lo);
+}
+
+function buildFillColor(stops: readonly number[]) {
+  const pairs = COLORS.flatMap((color, i) => [stops[i]!, color]);
+  return ["interpolate", ["linear"], ["get", "slope"], ...pairs];
 }
 
 /** First style layer (bottom-up order) that should paint above the slope: roads, bridges, tunnels, buildings. */
@@ -47,7 +57,7 @@ function findFirstLayerAboveSlope(map: mapboxgl.Map): string | undefined {
   return undefined;
 }
 
-function ensureSlopeLayer(map: mapboxgl.Map, maxSlope: number) {
+function ensureSlopeLayer(map: mapboxgl.Map, colorStops: readonly number[]) {
   if (!map.getSource(SLOPE_SOURCE)) {
     map.addSource(SLOPE_SOURCE, {
       type: "geojson",
@@ -61,7 +71,7 @@ function ensureSlopeLayer(map: mapboxgl.Map, maxSlope: number) {
       type: "fill",
       source: SLOPE_SOURCE,
       paint: {
-        "fill-color": buildFillColor(maxSlope) as any,
+        "fill-color": buildFillColor(colorStops) as any,
         "fill-opacity": 0.9,
         "fill-antialias": false,
       },
@@ -73,19 +83,21 @@ function roundZoom(z: number): number {
   return Math.round(z * 100) / 100;
 }
 
+const INITIAL_STOPS: number[] = [0, 5, 10, 15, 20];
+
 function App() {
-  const [maxSlope, setMaxSlope] = useState(MIN_SCALE);
+  const [colorStops, setColorStops] = useState<number[]>(INITIAL_STOPS);
   const [remaining, setRemaining] = useState<number | null>(null);
   const mapRef = useRef<MapRef>(null);
   const storeRef = useRef(new SlopeStore());
-  const maxSlopeRef = useRef(maxSlope);
-  maxSlopeRef.current = maxSlope;
+  const colorStopsRef = useRef(colorStops);
+  colorStopsRef.current = colorStops;
 
   useEffect(() => {
     const map = mapRef.current?.getMap();
     if (!map || !map.getLayer(SLOPE_LAYER)) return;
-    map.setPaintProperty(SLOPE_LAYER, "fill-color", buildFillColor(maxSlope) as any);
-  }, [maxSlope]);
+    map.setPaintProperty(SLOPE_LAYER, "fill-color", buildFillColor(colorStops) as any);
+  }, [colorStops]);
 
   useEffect(() => {
     let alive = true;
@@ -127,7 +139,7 @@ function App() {
           continue;
         }
 
-        ensureSlopeLayer(map, maxSlopeRef.current);
+        ensureSlopeLayer(map, colorStopsRef.current);
 
         const bounds = map.getBounds()!;
         const canvas = map.getCanvas();
@@ -186,8 +198,13 @@ function App() {
       }
       if (!visibleSlopes.length) return;
       visibleSlopes.sort((a, b) => a - b);
-      const pVal = visibleSlopes[Math.floor(visibleSlopes.length * PERCENTILE)];
-      setMaxSlope(Math.min(MAX_SCALE, Math.max(MIN_SCALE, pVal)));
+      const next = STOP_PERCENTILES.map((p) =>
+        Math.min(MAX_SCALE, Math.max(0, percentileOfSorted(visibleSlopes, p))),
+      );
+      for (let i = 1; i < next.length; i++) {
+        if (next[i]! < next[i - 1]!) next[i] = next[i - 1]!;
+      }
+      setColorStops(next);
     }
 
     loop();
@@ -250,14 +267,11 @@ function App() {
           justifyContent: "space-between",
           height: 160,
         }}>
-          {COLORS.slice().reverse().map((_, i, arr) => {
-            const slope = (maxSlope / (arr.length - 1)) * (arr.length - 1 - i);
-            return (
-              <span key={i} style={{ color: "#ffffffcc", fontSize: 11, lineHeight: 1 }}>
-                {slope.toFixed(0)}%
-              </span>
-            );
-          })}
+          {colorStops.slice().reverse().map((slope, i) => (
+            <span key={i} style={{ color: "#ffffffcc", fontSize: 11, lineHeight: 1 }}>
+              {slope.toFixed(0)}%
+            </span>
+          ))}
         </div>
       </div>
 
