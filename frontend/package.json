@@ -10,14 +10,23 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@ant-design/icons": "^6.1.1",
     "@mapbox/mapbox-gl-geocoder": "^5.1.0",
+    "@turf/turf": "^7.3.4",
     "@types/downloadjs": "^1.4.6",
     "@types/mapbox__mapbox-gl-draw": "^1.3.3",
     "@types/mapbox__mapbox-gl-geocoder": "^4.7.3",
     "@types/react-map-gl": "^6.1.7",
+    "antd": "^6.3.5",
+    "clsx": "^2.1.1",
+    "downloadjs": "^1.4.7",
+    "html2canvas": "^1.4.1",
+    "pat-web-utils": "^1.0.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
-    "react-map-gl": "^8.0.4"
+    "react-map-gl": "^8.0.4",
+    "react-query": "^3.39.3",
+    "usehooks-ts": "^3.1.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.32.0",
