@@ -269,7 +269,7 @@ function App() {
         }}>
           {colorStops.slice().reverse().map((slope, i) => (
             <span key={i} style={{ color: "#ffffffcc", fontSize: 11, lineHeight: 1 }}>
-              {slope.toFixed(0)}%
+              {slope.toFixed(1)}%
             </span>
           ))}
         </div>

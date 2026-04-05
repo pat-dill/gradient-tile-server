@@ -1,7 +1,7 @@
 import type { Feature, FeatureCollection, Polygon } from "geojson";
 import { eleAtCoord, prefetchTilesForBounds } from "./elevation.ts";
 
-const NEIGHBOR_OFFSET_M = 8;
+const NEIGHBOR_OFFSET_M = 10;
 const GRID_SPACING_PX = 2;
 const BATCH_SIZE = 30_000;
 
