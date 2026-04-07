@@ -1,28 +1,48 @@
 import './App.css'
 import Map from "react-map-gl/mapbox";
 import type { MapRef } from "react-map-gl/mapbox";
+import type { ExpressionSpecification } from "mapbox-gl";
 import 'mapbox-gl/dist/mapbox-gl.css';
 import { mapboxToken } from "./config.ts";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { computeGradients, GradientStore } from "./computeGradients.ts";
 import { processTick, SlopeStore } from "./computeSlopes.ts";
 import { buildWaterIndex, isPointOverWater, waterVectorSourceId } from "./waterIndex.ts";
 import { eleAtCoord } from "./elevation.ts";
+import { LockOutlined, UnlockOutlined } from "@ant-design/icons";
+import { Button, Progress, Segmented } from "antd";
 
+type ViewMode = "roads" | "terrain";
 
-const mapStyle = "mapbox://styles/mapbox/dark-v11";
+const MAP_STYLE_ROADS = "mapbox://styles/paricdil/cme3ipbul01pr01s24ymeep2j";
+const MAP_STYLE_TERRAIN = "mapbox://styles/mapbox/dark-v11";
+
+const GRADIENT_SOURCE = "gradient-data";
+const GRADIENT_LAYER = "gradient-lines";
+const ROAD_QUERY_SOURCE = "streets-v8";
+const ROAD_LOADER_LAYER = "road-loader";
 
 const SLOPE_SOURCE = "slope-data";
 const SLOPE_LAYER = "slope-fill";
 
-/** Below this zoom, slope cells are not computed and the overlay is cleared (the map can still zoom out). */
-const MIN_RENDER_ZOOM = 9;
-const MAX_SCALE = 100;
-/** Top of the scale uses this percentile of visible slopes (not 100%). */
-const HIGH_PERCENTILE = 0.985;
-/** One stop per color: P0, P20, P40, P60, P98.5 — scale position matches percentile except the cap above. */
-const STOP_PERCENTILES = [0, 0.3, 0.6, 0.9, HIGH_PERCENTILE] as const;
-const ZOOM_SETTLE_MS = 400;
 const COLORS = ["#00ff00", "#ffff00", "#ff0000", "#ff00ff", "#ffffff"];
+const HIGH_PERCENTILE = 0.985;
+
+/** Road grade scale (percent). */
+const MAX_GRADE_SCALE = 25;
+const GRADE_STOP_PERCENTILES = [0, 0.4, 0.667, 0.9, HIGH_PERCENTILE] as const;
+
+/** Terrain slope scale (percent grade equivalent). */
+const MAX_SLOPE_SCALE = 100;
+const SLOPE_STOP_PERCENTILES = [0, 0.3, 0.6, 0.9, HIGH_PERCENTILE] as const;
+
+const MIN_RENDER_ZOOM_SLOPE = 9;
+const ZOOM_SETTLE_MS = 400;
+
+const INITIAL_STOPS: number[] = [0, 5, 10, 15, 20];
+
+/** Meters above mean sea level → feet (international foot). */
+const M_TO_FT = 3.280839895013123;
 
 function percentileOfSorted(sorted: number[], p: number): number {
   const n = sorted.length;
@@ -37,9 +57,32 @@ function percentileOfSorted(sorted: number[], p: number): number {
   return a + (b - a) * (x - lo);
 }
 
-function buildFillColor(stops: readonly number[]) {
+function buildGradeColorExpression(stops: readonly number[]) {
+  const pairs = COLORS.flatMap((color, i) => [stops[i]!, color]);
+  return ["interpolate", ["linear"], ["get", "grade"], ...pairs];
+}
+
+function buildSlopeFillColor(stops: readonly number[]) {
   const pairs = COLORS.flatMap((color, i) => [stops[i]!, color]);
   return ["interpolate", ["linear"], ["get", "slope"], ...pairs];
+}
+
+function ensureRoadSource(map: mapboxgl.Map) {
+  if (!map.getSource(ROAD_QUERY_SOURCE)) {
+    map.addSource(ROAD_QUERY_SOURCE, {
+      type: "vector",
+      url: "mapbox://mapbox.mapbox-streets-v8",
+    });
+  }
+  if (!map.getLayer(ROAD_LOADER_LAYER)) {
+    map.addLayer({
+      id: ROAD_LOADER_LAYER,
+      type: "line",
+      source: ROAD_QUERY_SOURCE,
+      "source-layer": "road",
+      paint: { "line-opacity": 0.01, "line-width": 0.5 },
+    });
+  }
 }
 
 /** First style layer (bottom-up order) that should paint above the slope: roads, bridges, tunnels, buildings. */
@@ -58,7 +101,33 @@ function findFirstLayerAboveSlope(map: mapboxgl.Map): string | undefined {
   return undefined;
 }
 
-function ensureSlopeLayer(map: mapboxgl.Map, colorStops: readonly number[]) {
+function ensureGradientLayer(map: mapboxgl.Map, gradeStops: readonly number[]) {
+  if (!map.getSource(GRADIENT_SOURCE)) {
+    map.addSource(GRADIENT_SOURCE, {
+      type: "geojson",
+      data: { type: "FeatureCollection", features: [] },
+    });
+  }
+  if (!map.getLayer(GRADIENT_LAYER)) {
+    map.addLayer({
+      id: GRADIENT_LAYER,
+      type: "line",
+      source: GRADIENT_SOURCE,
+      minzoom: 12,
+      paint: {
+        "line-width": [
+          "interpolate", ["linear"], ["zoom"],
+          10, 1, 12, 2, 15, 5, 16, 5, 20, 10,
+        ],
+        "line-color": buildGradeColorExpression(gradeStops) as ExpressionSpecification,
+        "line-emissive-strength": 0.8,
+        "line-opacity": 0.8,
+      },
+    });
+  }
+}
+
+function ensureSlopeLayer(map: mapboxgl.Map, slopeStops: readonly number[]) {
   if (!map.getSource(SLOPE_SOURCE)) {
     map.addSource(SLOPE_SOURCE, {
       type: "geojson",
@@ -72,7 +141,7 @@ function ensureSlopeLayer(map: mapboxgl.Map, colorStops: readonly number[]) {
       type: "fill",
       source: SLOPE_SOURCE,
       paint: {
-        "fill-color": buildFillColor(colorStops) as any,
+        "fill-color": buildSlopeFillColor(slopeStops) as ExpressionSpecification,
         "fill-opacity": 0.9,
         "fill-antialias": false,
       },
@@ -84,10 +153,9 @@ function roundZoom(z: number): number {
   return Math.round(z * 100) / 100;
 }
 
-const INITIAL_STOPS: number[] = [0, 5, 10, 15, 20];
-
-/** Meters above mean sea level → feet (international foot). */
-const M_TO_FT = 3.280839895013123;
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 type HoverElevation =
   | { ok: true; meters: number }
@@ -95,21 +163,149 @@ type HoverElevation =
   | { ok: false; pending?: boolean };
 
 function App() {
-  const [colorStops, setColorStops] = useState<number[]>(INITIAL_STOPS);
+  const [viewMode, setViewMode] = useState<ViewMode>("roads");
+  const viewModeRef = useRef(viewMode);
+  viewModeRef.current = viewMode;
+
+  const [gradeStops, setGradeStops] = useState<number[]>(INITIAL_STOPS);
+  const [slopeStops, setSlopeStops] = useState<number[]>(INITIAL_STOPS);
+  const gradeStopsRef = useRef(gradeStops);
+  gradeStopsRef.current = gradeStops;
+  const slopeStopsRef = useRef(slopeStops);
+  slopeStopsRef.current = slopeStops;
+
+  const [stopsLocked, setStopsLocked] = useState(false);
+  const stopsLockedRef = useRef(stopsLocked);
+  stopsLockedRef.current = stopsLocked;
+
+  const [progress, setProgress] = useState<{ processed: number; total: number } | null>(null);
   const [remaining, setRemaining] = useState<number | null>(null);
   const [hoverElevation, setHoverElevation] = useState<HoverElevation | null>(null);
+
   const mapRef = useRef<MapRef>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const computingRef = useRef(false);
+  const readyRef = useRef(false);
+  const gradientStoreRef = useRef(new GradientStore());
+  const slopeStoreRef = useRef(new SlopeStore());
   const hoverElevSeqRef = useRef(0);
   const hoverElevDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const storeRef = useRef(new SlopeStore());
-  const colorStopsRef = useRef(colorStops);
-  colorStopsRef.current = colorStops;
+
+  const mapStyle = viewMode === "terrain" ? MAP_STYLE_TERRAIN : MAP_STYLE_ROADS;
+
+  const gradeColorExpr = useMemo(() => buildGradeColorExpression(gradeStops), [gradeStops]);
+
+  useEffect(() => {
+    const map = mapRef.current?.getMap();
+    if (map && map.getLayer(GRADIENT_LAYER)) {
+      map.setPaintProperty(GRADIENT_LAYER, "line-color", gradeColorExpr as ExpressionSpecification);
+    }
+  }, [gradeColorExpr]);
 
   useEffect(() => {
     const map = mapRef.current?.getMap();
     if (!map || !map.getLayer(SLOPE_LAYER)) return;
-    map.setPaintProperty(SLOPE_LAYER, "fill-color", buildFillColor(colorStops) as any);
-  }, [colorStops]);
+    map.setPaintProperty(SLOPE_LAYER, "fill-color", buildSlopeFillColor(slopeStops) as ExpressionSpecification);
+  }, [slopeStops]);
+
+  useEffect(() => {
+    if (viewMode !== "roads") {
+      const map = mapRef.current?.getMap();
+      const src = map?.getSource(GRADIENT_SOURCE) as mapboxgl.GeoJSONSource | undefined;
+      if (src) src.setData({ type: "FeatureCollection", features: [] });
+      gradientStoreRef.current = new GradientStore();
+      setProgress(null);
+    }
+  }, [viewMode]);
+
+  useEffect(() => {
+    if (viewMode !== "terrain") {
+      const map = mapRef.current?.getMap();
+      const src = map?.getSource(SLOPE_SOURCE) as mapboxgl.GeoJSONSource | undefined;
+      if (src) src.setData({ type: "FeatureCollection", features: [] });
+      slopeStoreRef.current = new SlopeStore();
+      setRemaining(null);
+      setHoverElevation(null);
+    }
+  }, [viewMode]);
+
+  const onMapLoad = useCallback(() => {
+    const map = mapRef.current?.getMap();
+    if (!map) return;
+    if (viewModeRef.current === "terrain") {
+      if (!map.getSource("mapbox-dem")) {
+        map.addSource("mapbox-dem", {
+          type: "raster-dem",
+          url: "mapbox://mapbox.mapbox-terrain-dem-v1",
+          tileSize: 512,
+          maxzoom: 14,
+        });
+      }
+      map.setTerrain({ source: "mapbox-dem", exaggeration: 1 });
+    } else {
+      ensureRoadSource(map);
+    }
+    readyRef.current = true;
+  }, []);
+
+  const updateGradients = useCallback(() => {
+    if (viewModeRef.current !== "roads" || !readyRef.current || computingRef.current) return;
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(async () => {
+      const map = mapRef.current?.getMap();
+      if (!map || !map.isStyleLoaded()) return;
+      if (map.getZoom() < 11) return;
+
+      ensureRoadSource(map);
+      ensureGradientLayer(map, gradeStopsRef.current);
+
+      computingRef.current = true;
+      const src = map.getSource(GRADIENT_SOURCE) as mapboxgl.GeoJSONSource | undefined;
+      const store = gradientStoreRef.current;
+
+      try {
+        await computeGradients(map, store, {
+          onProgress(processed, total) {
+            setProgress({ processed, total });
+          },
+          onFlush(fc) {
+            if (src) src.setData(fc);
+          },
+        });
+        setProgress(null);
+
+        const bounds = map.getBounds()!;
+        const grades: number[] = [];
+        for (const f of store.segments) {
+          const grade = f.properties?.grade;
+          if (typeof grade !== "number" || grade <= 0) continue;
+          const c = f.geometry.coordinates[0];
+          if (c[0] >= bounds.getWest() && c[0] <= bounds.getEast() &&
+            c[1] >= bounds.getSouth() && c[1] <= bounds.getNorth()) {
+            grades.push(grade);
+          }
+        }
+        if (!grades.length) return;
+
+        grades.sort((a, b) => a - b);
+        const next = GRADE_STOP_PERCENTILES.map((p) =>
+          Math.min(MAX_GRADE_SCALE, Math.max(0, percentileOfSorted(grades, p))),
+        );
+        for (let i = 1; i < next.length; i++) {
+          if (next[i]! < next[i - 1]!) next[i] = next[i - 1]!;
+        }
+        if (!stopsLockedRef.current) setGradeStops(next);
+      } finally {
+        computingRef.current = false;
+      }
+    }, 300);
+  }, []);
+
+  useEffect(() => {
+    if (viewMode === "roads") {
+      updateGradients();
+    }
+  }, [viewMode, updateGradients]);
 
   useEffect(() => {
     let alive = true;
@@ -118,6 +314,11 @@ function App() {
 
     async function loop() {
       while (alive) {
+        if (viewModeRef.current !== "terrain") {
+          await sleep(200);
+          continue;
+        }
+
         const map = mapRef.current?.getMap();
         if (!map || !map.isStyleLoaded()) {
           await sleep(200);
@@ -126,9 +327,9 @@ function App() {
 
         const zoom = roundZoom(map.getZoom());
 
-        if (zoom < MIN_RENDER_ZOOM) {
-          if (lastZoom === null || lastZoom >= MIN_RENDER_ZOOM) {
-            storeRef.current = new SlopeStore();
+        if (zoom < MIN_RENDER_ZOOM_SLOPE) {
+          if (lastZoom === null || lastZoom >= MIN_RENDER_ZOOM_SLOPE) {
+            slopeStoreRef.current = new SlopeStore();
             const src = map.getSource(SLOPE_SOURCE) as mapboxgl.GeoJSONSource | undefined;
             if (src) src.setData({ type: "FeatureCollection", features: [] });
             setRemaining(null);
@@ -139,7 +340,7 @@ function App() {
         }
 
         if (lastZoom !== null && zoom !== lastZoom) {
-          storeRef.current = new SlopeStore();
+          slopeStoreRef.current = new SlopeStore();
           zoomChangedAt = Date.now();
           const src = map.getSource(SLOPE_SOURCE) as mapboxgl.GeoJSONSource | undefined;
           if (src) src.setData({ type: "FeatureCollection", features: [] });
@@ -151,11 +352,11 @@ function App() {
           continue;
         }
 
-        ensureSlopeLayer(map, colorStopsRef.current);
+        ensureSlopeLayer(map, slopeStopsRef.current);
 
         const bounds = map.getBounds()!;
         const canvas = map.getCanvas();
-        const store = storeRef.current;
+        const store = slopeStoreRef.current;
 
         const vectorId = waterVectorSourceId(map);
         if (vectorId && !map.isSourceLoaded(vectorId)) {
@@ -186,7 +387,7 @@ function App() {
           setRemaining(rem);
 
           if (rem === 0) {
-            updateScale(store, bounds, map);
+            updateSlopeScale(store, bounds);
           }
         } else {
           setRemaining(null);
@@ -197,7 +398,7 @@ function App() {
       }
     }
 
-    function updateScale(store: SlopeStore, bounds: mapboxgl.LngLatBounds, _map: mapboxgl.Map) {
+    function updateSlopeScale(store: SlopeStore, bounds: mapboxgl.LngLatBounds) {
       const visibleSlopes: number[] = [];
       for (const f of store.cells.values()) {
         const s = f.properties?.slope;
@@ -210,13 +411,13 @@ function App() {
       }
       if (!visibleSlopes.length) return;
       visibleSlopes.sort((a, b) => a - b);
-      const next = STOP_PERCENTILES.map((p) =>
-        Math.min(MAX_SCALE, Math.max(0, percentileOfSorted(visibleSlopes, p))),
+      const next = SLOPE_STOP_PERCENTILES.map((p) =>
+        Math.min(MAX_SLOPE_SCALE, Math.max(0, percentileOfSorted(visibleSlopes, p))),
       );
       for (let i = 1; i < next.length; i++) {
         if (next[i]! < next[i - 1]!) next[i] = next[i - 1]!;
       }
-      setColorStops(next);
+      if (!stopsLockedRef.current) setSlopeStops(next);
     }
 
     loop();
@@ -230,6 +431,8 @@ function App() {
   const HOVER_DEM_DEBOUNCE_MS = 55;
 
   const onMapMouseMove = useCallback((e: mapboxgl.MapLayerMouseEvent) => {
+    if (viewModeRef.current !== "terrain") return;
+
     const map = mapRef.current?.getMap();
     const { lngLat } = e;
     const lat = lngLat.lat;
@@ -276,7 +479,12 @@ function App() {
     setHoverElevation(null);
   }, []);
 
-  const totalVisible = remaining !== null ? remaining : null;
+  const pct = progress
+    ? Math.round((progress.processed / progress.total) * 100)
+    : null;
+
+  const legendStops = viewMode === "roads" ? gradeStops : slopeStops;
+  const legendTitle = viewMode === "roads" ? "Grade" : "Slope";
 
   return (
     <div style={{ width: "100vw", height: "100vh" }}>
@@ -286,28 +494,38 @@ function App() {
         initialViewState={{
           longitude: -122.4,
           latitude: 37.8,
-          zoom: 14
+          zoom: 14,
         }}
         style={{ width: "100%", height: "100%" }}
         projection="globe"
         mapStyle={mapStyle}
-        terrain={{ source: "mapbox-dem", exaggeration: 1 }}
-        onLoad={() => {
-          const map = mapRef.current?.getMap();
-          if (!map) return;
-          if (!map.getSource("mapbox-dem")) {
-            map.addSource("mapbox-dem", {
-              type: "raster-dem",
-              url: "mapbox://mapbox.mapbox-terrain-dem-v1",
-              tileSize: 512,
-              maxzoom: 14,
-            });
-          }
-          map.setTerrain({ source: "mapbox-dem", exaggeration: 1 });
-        }}
+        terrain={viewMode === "terrain" ? { source: "mapbox-dem", exaggeration: 1 } : undefined}
+        onLoad={onMapLoad}
+        onIdle={updateGradients}
         onMouseMove={onMapMouseMove}
         onMouseOut={onMapMouseOut}
       />
+
+      <div style={{
+        position: "fixed",
+        left: 16,
+        top: 16,
+        zIndex: 10,
+        background: "rgba(0, 0, 0, 0.75)",
+        backdropFilter: "blur(12px)",
+        borderRadius: 10,
+        padding: 6,
+      }}>
+        <Segmented<ViewMode>
+          value={viewMode}
+          onChange={(v) => setViewMode(v)}
+          options={[
+            { label: "Roads", value: "roads" },
+            { label: "Terrain", value: "terrain" },
+          ]}
+        />
+      </div>
+
       <div style={{
         position: "fixed",
         right: 16,
@@ -319,30 +537,64 @@ function App() {
         padding: "12px 14px",
         zIndex: 10,
         display: "flex",
-        alignItems: "center",
-        gap: 10,
+        flexDirection: "column",
+        gap: 8,
       }}>
         <div style={{
-          width: 14,
-          height: 160,
-          borderRadius: 7,
-          background: `linear-gradient(to top, ${COLORS.join(", ")})`,
-        }} />
+          display: "flex",
+          alignItems: "center",
+          gap: 4,
+          color: "#ffffff99",
+          fontSize: 10,
+          textTransform: "uppercase",
+          letterSpacing: "0.04em",
+        }}>
+          <span>{legendTitle}</span>
+          <Button
+            type="text"
+            size="small"
+            icon={stopsLocked ? <LockOutlined /> : <UnlockOutlined />}
+            onClick={() => setStopsLocked((v) => !v)}
+            aria-label={stopsLocked ? "Unlock color stops" : "Lock color stops"}
+            title={stopsLocked ? "Unlock to resume auto scale" : "Lock color stops"}
+            style={{
+              color: stopsLocked ? "#ffb020" : "#ffffffaa",
+              padding: 0,
+              width: 22,
+              height: 22,
+              minWidth: 22,
+              lineHeight: 1,
+            }}
+          />
+        </div>
         <div style={{
           display: "flex",
-          flexDirection: "column",
-          justifyContent: "space-between",
-          height: 160,
+          alignItems: "stretch",
+          gap: 10,
         }}>
-          {colorStops.slice().reverse().map((slope, i) => (
-            <span key={i} style={{ color: "#ffffffcc", fontSize: 11, lineHeight: 1 }}>
-              {slope.toFixed(1)}%
-            </span>
-          ))}
+          <div style={{
+            width: 14,
+            height: 160,
+            borderRadius: 7,
+            flexShrink: 0,
+            background: `linear-gradient(to top, ${COLORS.join(", ")})`,
+          }} />
+          <div style={{
+            display: "flex",
+            flexDirection: "column",
+            justifyContent: "space-between",
+            height: 160,
+          }}>
+            {legendStops.slice().reverse().map((v, i) => (
+              <span key={i} style={{ color: "#ffffffcc", fontSize: 11, lineHeight: 1 }}>
+                {v.toFixed(1)}%
+              </span>
+            ))}
+          </div>
         </div>
       </div>
 
-      {hoverElevation !== null && (
+      {viewMode === "terrain" && hoverElevation !== null && (
         <div style={{
           position: "fixed",
           left: 16,
@@ -378,7 +630,33 @@ function App() {
         </div>
       )}
 
-      {totalVisible !== null && totalVisible > 0 && (
+      {viewMode === "roads" && pct !== null && (
+        <div style={{
+          position: "fixed",
+          bottom: 24,
+          left: "50%",
+          transform: "translateX(-50%)",
+          background: "rgba(0, 0, 0, 0.75)",
+          backdropFilter: "blur(12px)",
+          padding: "10px 20px 8px",
+          borderRadius: 10,
+          zIndex: 10,
+          minWidth: 260,
+        }}>
+          <div style={{ color: "#ffffffcc", fontSize: 12, marginBottom: 6 }}>
+            Computing grades — {progress!.processed} / {progress!.total} roads
+          </div>
+          <Progress
+            percent={pct}
+            strokeColor="#1677ff"
+            trailColor="rgba(255,255,255,0.12)"
+            showInfo={false}
+            size="small"
+          />
+        </div>
+      )}
+
+      {viewMode === "terrain" && remaining !== null && remaining > 0 && (
         <div style={{
           position: "fixed",
           bottom: 24,
@@ -392,16 +670,12 @@ function App() {
           minWidth: 220,
         }}>
           <div style={{ color: "#ffffffcc", fontSize: 12 }}>
-            {totalVisible.toLocaleString()} cells remaining
+            {remaining.toLocaleString()} cells remaining
           </div>
         </div>
       )}
     </div>
-  )
+  );
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-export default App
+export default App;
